@@ -1,0 +1,340 @@
+#include <ESP8266WiFi.h>
+#include <Wire.h>  // I2C总线通信
+#include <Adafruit_Sensor.h> // Adafruit传感器通用库
+#include <Adafruit_AHTX0.h> // AHTX0温湿度传感器库
+#include <Adafruit_BMP280.h>// BMP280气压传感器库
+#include <RtcDS1302.h> // DS1302实时时钟库
+#include <PubSubClient.h> // MQTT客户端库
+#include <U8g2lib.h>  // OLED显示库
+#define DEVICE_ID "ESP005" 
+
+// 定义DS1302的引脚
+#define DS1302_CLK_PIN D5
+#define DS1302_DAT_PIN D6
+#define DS1302_RST_PIN D7
+
+// WIFI 相关信息
+const char* WIFINAME = "N6-506-ARM";
+const char* WIFIPASSWORD = "armn6-506qwg";
+
+// MQTT服务器相关信息
+const char* mqtt_server = "192.168.3.93";
+const char* mqtt_topic = "sensors/data";
+const char* mqtt_clientId = "ESP8266_Sensor_Client";
+const int mqtt_port = 1883;
+
+// 创建 ThreeWire 对象
+ThreeWire myWire(DS1302_DAT_PIN, DS1302_CLK_PIN, DS1302_RST_PIN);
+// RTC 对象
+RtcDS1302<ThreeWire> rtc(myWire);
+
+// WiFi和MQTT客户端对象
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// 光照传感器I2C地址
+#define LIGHT_SENSOR_ADDR 0x23
+
+// OLED显示对象
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, 5, 4, U8X8_PIN_NONE);
+
+// AHTX0 传感器相关定义
+Adafruit_AHTX0 aht;
+Adafruit_Sensor *aht_humidity, *aht_temp;
+
+// BMP280 传感器相关定义
+#define BMP280_ADDRESS 0x76
+Adafruit_BMP280 bmp;
+
+// 存储传感器数据的全局变量（方便显示函数访问）
+float g_temp = 0.0;
+float g_humidity = 0.0;
+float g_pressure = 0.0;
+int g_light = 0;
+String g_datetime = "";  // 存储时间戳
+
+// WIFI连接函数
+void connectWifi(const char* wifiName, const char* wifiPassword, uint8_t waitTime) {
+    WiFi.mode(WIFI_STA); // 设置ESP8266为“客户端模式”（连路由器，不是当路由器）
+    WiFi.disconnect();  // 断开之前的连接
+    WiFi.begin(wifiName, wifiPassword); 
+    uint8_t count = 0;
+    while (WiFi.status() != WL_CONNECTED) { // 开始连接WiFi
+        delay(1000);
+        Serial.printf("connect WIFI...%ds\r\n", ++count);
+        if (count >= waitTime) { // 超时判断（默认20秒）
+            Serial.println("connect WIFI fail");
+            while (1) { // 连接失败则死循环
+                delay(1000);
+                Serial.println("Stuck in WiFi failure");
+            }
+        }
+    }
+    // 连接成功，打印WiFi名和本地IP
+    Serial.printf("connect WIFI %s success, local IP is %s\r\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+}
+
+// MQTT连接/重连函数
+void reconnectMQTT() {
+  int maxAttempts = 10; // 最多重试10次
+  int attempts = 0;
+  
+  while (!mqttClient.connected() && attempts < maxAttempts) { // 未连接且未超时
+    Serial.print("Attempting MQTT connection as ");
+    Serial.print(mqtt_clientId);
+    Serial.print(" to ");
+    Serial.print(mqtt_server);
+    Serial.print(":");
+    Serial.println(mqtt_port);
+    
+    if (mqttClient.connect(mqtt_clientId)) { // 尝试连接MQTT服务器
+      Serial.println("connected to MQTT broker");
+    } else { // 连接失败
+      Serial.print("failed, rc=");
+      Serial.println(mqttClient.state()); // 打印错误码
+      Serial.println(" try again in 5 seconds");
+      
+      switch(mqttClient.state()) {
+        case -4: Serial.println("MQTT_CONNECTION_TIMEOUT"); break;
+        case -3: Serial.println("MQTT_CONNECTION_LOST"); break;
+        case -2: Serial.println("MQTT_CONNECT_FAILED"); break;
+        case -1: Serial.println("MQTT_DISCONNECTED"); break;
+        case 1: Serial.println("MQTT_CONNECT_BAD_PROTOCOL"); break;
+        case 2: Serial.println("MQTT_CONNECT_BAD_CLIENT_ID"); break;
+        case 3: Serial.println("MQTT_CONNECT_UNAVAILABLE"); break;
+        case 4: Serial.println("MQTT_CONNECT_BAD_CREDENTIALS"); break;
+        case 5: Serial.println("MQTT_CONNECT_UNAUTHORIZED"); break;
+      }
+      
+      delay(5000); // 5秒后重试
+    }
+    attempts++;
+  }
+  
+  if (attempts >= maxAttempts) { // 重试10次失败，重启ESP
+    Serial.println("Max MQTT connection attempts reached. Restarting...");
+    ESP.restart();
+  }
+}
+
+// 读取DS1302时间并格式化
+String readRtcTime() {
+    RtcDateTime now = rtc.GetDateTime();
+    
+    // 格式化时间：YYYY-MM-DD HH:MM:SS
+    char buffer[20];
+    snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d",
+             now.Year(), now.Month(), now.Day(),
+             now.Hour(), now.Minute(), now.Second());
+    
+    return String(buffer);
+}
+
+// 采集传感器数据（更新全局变量）
+void collectSensorData() {
+    // 读取DS1302时间
+    g_datetime = readRtcTime();
+    
+    // 读取 AHTX0 温湿度
+    sensors_event_t humidity, temp;
+    if (aht_humidity && aht_temp && aht_humidity->getEvent(&humidity) && aht_temp->getEvent(&temp)) {
+        g_temp = temp.temperature; // 温度存到全局变量
+        g_humidity = humidity.relative_humidity;  // 湿度存到全局变量
+    } else {
+        g_temp = -999; // 错误标记
+        g_humidity = -999;
+    }
+
+    // 读取 BMP280 气压
+    if (bmp.begin(BMP280_ADDRESS)) {
+        g_pressure = bmp.readPressure() / 100.0; // 转换为hPa（百帕，常用单位）
+    } else {
+        g_pressure = -999; // 错误标记
+    }
+
+    // 读取光照传感器
+    Wire.beginTransmission(LIGHT_SENSOR_ADDR);
+    Wire.write(0x01); // 上电命令
+    Wire.endTransmission();
+    Wire.beginTransmission(LIGHT_SENSOR_ADDR);
+    Wire.write(0x10); // 连续高分辨率模式
+    Wire.endTransmission();
+    delay(180);
+    Wire.requestFrom(LIGHT_SENSOR_ADDR, 2);
+    
+    if (Wire.available() >= 2) {
+        uint8_t msb = Wire.read(); // 高位字节
+        uint8_t lsb = Wire.read(); // 低位字节
+        g_light = ((msb << 8) | lsb) / 1.2;  // 计算光照值（lx，勒克斯）
+    } else {
+        g_light = -1; // 错误标记
+    }
+}
+
+// 构建MQTT发送的数据字符串
+String buildMQTTData() {
+    String data = "{";
+    data += "\"id\":\"" + String(DEVICE_ID) + "\",";
+    data += "\"datetime\":\"" + g_datetime + "\","; 
+    data += "\"AHTX0_Temp\":" + String(g_temp) + ",";
+    data += "\"AHTX0_Humidity\":" + String(g_humidity) + ",";
+    data += "\"BMP280_Pressure\":" + String(g_pressure) + ",";
+    data += "\"Light\":" + String(g_light);
+    data += "}";
+    return data;
+}
+
+// 在OLED上显示数据
+void displayOnOLED() {
+    u8g2.clearBuffer();  // 清空缓冲区
+    
+    // 使用超小字体，确保能显示更多内容
+    u8g2.setFont(u8g2_font_6x10_tf);  // 极小字体，128宽度可显示21个字符
+    
+    // 第一行：时间戳（核心新增）
+    u8g2.setCursor(0, 10);
+    if (g_datetime.length() > 0) {
+        // 分两行显示完整时间戳，避免超出屏幕
+        u8g2.print(g_datetime.substring(0, 10));  // 显示日期：YYYY-MM-DD
+        u8g2.setCursor(0, 22);
+        u8g2.print(g_datetime.substring(11));     // 显示时间：HH:MM:SS
+    } else {
+        u8g2.print("Time: Err");
+    }
+    
+    // 第三行：温度 + 湿度
+    u8g2.setCursor(0, 36);
+    u8g2.print("T:");
+    if (g_temp != -999) {
+        u8g2.print(g_temp, 1);
+        u8g2.print("C");
+    } else {
+        u8g2.print("Err");
+    }
+    u8g2.print("  H:");
+    if (g_humidity != -999) {
+        u8g2.print(g_humidity, 1);
+        u8g2.print("%");
+    } else {
+        u8g2.print("Err");
+    }
+    
+    // 第四行：气压 + 光照
+    u8g2.setCursor(0, 48);
+    u8g2.print("P:");
+    if (g_pressure != -999) {
+        u8g2.print(g_pressure, 0);
+        u8g2.print("hPa");
+    } else {
+        u8g2.print("Err");
+    }
+    u8g2.print("  L:");
+    if (g_light != -1) {
+        u8g2.print(g_light);
+        u8g2.print("lx");
+    } else {
+        u8g2.print("Err");
+    }
+    
+    // 第五行：设备ID（精简显示）
+    u8g2.setCursor(0, 60);
+    u8g2.print("ID:");
+    u8g2.print(DEVICE_ID);
+
+    u8g2.sendBuffer();  // 发送缓冲区数据到OLED显示
+}
+
+// 设置DS1302初始时间（首次使用时取消注释设置）
+void setRtcInitialTime() {
+    // 使用编译时间
+    RtcDateTime compiled = RtcDateTime(__DATE__, __TIME__);
+    // 禁用写保护
+    rtc.SetIsWriteProtected(false);
+    // 设置时间
+    rtc.SetDateTime(compiled);
+    // 重新启用写保护（可选，防止误修改）
+    rtc.SetIsWriteProtected(true);
+    
+    Serial.println("RTC time initialized!");
+}
+
+// 初始化函数
+void setup() {
+    delay(1000);
+    Serial.begin(115200);
+    Serial.println("\n\nESP8266 Sensor MQTT Publisher + OLED Display");
+    
+    // 初始化OLED
+    u8g2.begin();
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.setCursor(20, 32);
+    u8g2.print("Initializing...");
+    u8g2.sendBuffer();
+    delay(1000);
+    
+    Wire.begin();
+
+    // 初始化 AHTX0
+    if (!aht.begin()) {
+        Serial.println("Could not find AHTX0 sensor!");
+    } else {
+        aht_humidity = aht.getHumiditySensor();
+        aht_temp = aht.getTemperatureSensor();
+    }
+
+    // 初始化 BMP280
+    if (!bmp.begin(BMP280_ADDRESS)) {
+        Serial.println("Could not find BMP280 sensor!");
+    } else {
+        bmp.setSampling(Adafruit_BMP280::MODE_NORMAL);
+    }
+
+    // 初始化 RTC
+    rtc.Begin();
+    
+    // 检查RTC是否运行
+    if (!rtc.IsDateTimeValid()) {
+        Serial.println("RTC lost power, setting initial time!");
+        // 首次使用或掉电后设置时间（只需要运行一次，之后注释掉）
+        // setRtcInitialTime();  // 首次使用时取消注释
+    }
+    
+    // 确保RTC可以读取（禁用写保护）
+    rtc.SetIsWriteProtected(false);
+    
+    // 连接 WIFI
+    connectWifi(WIFINAME, WIFIPASSWORD, 20);
+    
+    // 设置MQTT服务器
+    mqttClient.setServer(mqtt_server, mqtt_port);
+    mqttClient.setBufferSize(1024);
+}
+
+// 循环函数
+void loop() {
+    // 检查MQTT连接
+    if (!mqttClient.connected()) {
+        reconnectMQTT();
+    }
+    mqttClient.loop();
+    
+    // 采集传感器数据
+    collectSensorData();
+    
+    // 在OLED上显示数据
+    displayOnOLED();
+    
+    // 构建并发送MQTT数据
+    String sensorData = buildMQTTData();
+    if (mqttClient.publish(mqtt_topic, sensorData.c_str())) {
+        Serial.println("Data sent to MQTT server:");
+        Serial.println(sensorData);
+    } else {
+        Serial.println("Failed to send data to MQTT server");
+        Serial.println("Error code: " + String(mqttClient.state()));
+    }
+
+    // 每隔10分钟采集一次数据（600000毫秒）
+    delay(10000);
+}
